@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import requests
-from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError, RequestException
 
 import aiod
 from aiod.authentication import set_token, Token
@@ -24,23 +24,23 @@ PLATFORM_NAME = "zenodo"
 
 STOP_ON_UNEXPECTED_ERROR: bool = False
 PER_DATASET_DELAY: Optional[float] = None
+ZENODO_PAGE_SIZE: int = 25
 
 
 class ParsingError(Exception):
-    """Raised when a Zenodo response cannot be parsed as expected."""
+    pass
 
 
 class ServerError(Exception):
-    """Raised when Zenodo returns a non-success HTTP status."""
+    pass
 
 
-def _paginate_zenodo_records(page_size: int = 100) -> Iterator[dict]:
-    """
-    Generator that paginates over Zenodo records via the public REST API.
-    We use most-recent-first ordering and include all versions.
-    """
+def _paginate_zenodo_records(page_size: Optional[int] = None) -> Iterator[dict]:
     base_url = "https://zenodo.org/api/records"
     page = 1
+
+    if page_size is None:
+        page_size = ZENODO_PAGE_SIZE
 
     while True:
         params = {
@@ -50,16 +50,33 @@ def _paginate_zenodo_records(page_size: int = 100) -> Iterator[dict]:
             "sort": "mostrecent",
         }
         logger.debug("Requesting Zenodo records: %s params=%s", base_url, params)
-        response = requests.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
+
+        try:
+            response = requests.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
+        except RequestException as e:
+            logger.warning(
+                "Request error while fetching %s (page %s): %s; skipping this page and continuing.",
+                base_url,
+                page,
+                e,
+            )
+            page += 1
+            continue
+
         if not response.ok:
             try:
                 content = response.json()
             except Exception:
                 content = response.text
-            raise ServerError(
-                f"Error while fetching {base_url} from Zenodo: "
-                f"({response.status_code}) {content}"
+            logger.warning(
+                "Non-OK response while fetching %s (page %s): (%s) %s; skipping this page and continuing.",
+                response.url,
+                page,
+                response.status_code,
+                content,
             )
+            page += 1
+            continue
 
         try:
             data = response.json()
@@ -83,9 +100,6 @@ def _paginate_zenodo_records(page_size: int = 100) -> Iterator[dict]:
 
 
 def list_records(from_id: Optional[int] = None) -> Iterator[dict]:
-    """
-    Iterate over Zenodo records, optionally skipping everything with id < from_id.
-    """
     from_id = from_id or 0
     for record in _paginate_zenodo_records():
         try:
@@ -97,16 +111,28 @@ def list_records(from_id: Optional[int] = None) -> Iterator[dict]:
         if identifier < from_id:
             continue
 
-        yield fetch_zenodo_record(identifier)
+        try:
+            full_record = fetch_zenodo_record(identifier)
+        except (ServerError, ParsingError, RequestException) as e:
+            logger.warning(
+                "Skipping Zenodo record %s due to fetch error: %s", identifier, e
+            )
+            continue
+
+        yield full_record
 
 
 def fetch_zenodo_record(identifier: int) -> dict:
-    """
-    Fetch a single Zenodo record by numeric identifier.
-    """
     url = f"https://zenodo.org/api/records/{identifier}"
     logger.debug("Fetching Zenodo record %s", url)
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
+
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+    except RequestException as e:
+        logger.warning("Request error while fetching %s: %s", url, e)
+        raise ServerError(
+            f"Error while fetching {url} from Zenodo: request error {e}"
+        ) from e
 
     if not response.ok:
         try:
@@ -128,16 +154,17 @@ def fetch_zenodo_record(identifier: int) -> dict:
 
 
 def _convert_record_to_aiod(record: dict) -> dict:
-    """
-    Convert a Zenodo record JSON into an AIoD dataset metadata dict suitable
-    for aiod.datasets.register/replace.
-    """
     numeric_id = int(record["id"])
     identifier = str(numeric_id)
     metadata = record.get("metadata", {}) or {}
     links = record.get("links", {}) or {}
 
     title = metadata.get("title") or f"Zenodo record {identifier}"
+    if not isinstance(title, str):
+        title = str(title)
+    if len(title) > 256:
+        text_break = " [...]"
+        title = title[: 256 - len(text_break)] + text_break
 
     description = metadata.get("description") or ""
     if not isinstance(description, str):
@@ -211,18 +238,16 @@ def _convert_record_to_aiod(record: dict) -> dict:
 
 
 def upsert_dataset(record: dict) -> int:
-    """
-    Upsert a Zenodo record into AIoD as a dataset.
-    """
     identifier = str(record["id"])
 
     try:
         local_dataset = _convert_record_to_aiod(record)
+        platform_identifier = local_dataset["platform_resource_identifier"]
 
         try:
             aiod_dataset = aiod.datasets.get_asset_from_platform(
                 platform=PLATFORM_NAME,
-                platform_identifier=identifier,
+                platform_identifier=platform_identifier,
                 data_format="json",
             )
         except KeyError:
@@ -231,12 +256,11 @@ def upsert_dataset(record: dict) -> int:
             logger.warning(
                 "Non-JSON response when checking existing Zenodo asset %s in AIoD: %s. "
                 "Treating as not found and attempting registration.",
-                identifier,
+                platform_identifier,
                 e,
             )
             aiod_dataset = None
 
-        # Register new dataset
         if aiod_dataset is None:
             response = aiod.datasets.register(metadata=local_dataset)
             if isinstance(response, str):
@@ -341,13 +365,7 @@ def parse_args():
 
 
 def configure_connector():
-    """
-    Load environment variables, configure AIoD SDK, and set up the client token.
-
-    We explicitly *skip* the authorization_test check, mirroring the OpenML
-    connector fix you already applied, to avoid brittle JSON expectations.
-    """
-    global PLATFORM_NAME, STOP_ON_UNEXPECTED_ERROR, PER_DATASET_DELAY
+    global PLATFORM_NAME, STOP_ON_UNEXPECTED_ERROR, PER_DATASET_DELAY, ZENODO_PAGE_SIZE
 
     dot_file = Path("~/.aiod/zenodo/.env").expanduser()
     if dot_file.exists() and load_dotenv(dot_file):
@@ -364,6 +382,17 @@ def configure_connector():
         str(os.getenv("STOP_ON_UNEXPECTED_ERROR", str(STOP_ON_UNEXPECTED_ERROR))).lower()
         == "true"
     )
+
+    page_size_env = os.getenv("ZENODO_PAGE_SIZE")
+    if page_size_env:
+        try:
+            ZENODO_PAGE_SIZE = int(page_size_env)
+        except ValueError:
+            logger.warning(
+                "Invalid ZENODO_PAGE_SIZE=%r; falling back to %d",
+                page_size_env,
+                ZENODO_PAGE_SIZE,
+            )
 
     token = os.getenv("CLIENT_SECRET")
     assert token, "CLIENT_SECRET environment variable not set"
